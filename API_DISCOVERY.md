@@ -49,7 +49,10 @@
 ## Implementation Notes
 
 - The actor first calls `/api/v1/products/{slug}/reviews` to get `totalCount`.
-- It then fetches only the review pages required for `results_wanted`.
+- The API `totalCount` is treated as metadata only, not as a pagination cap. User input wins: if
+  `results_wanted` is 300, the actor keeps fetching review pages until 300 unique reviews are saved or
+  review pages stop returning new review slugs.
+- It fetches review pages in batches and stops on either the requested count or `no_more_reviews`.
 - Page requests use the Android mobile Chrome profile first because it returned the full Apify review payload when desktop/iOS sometimes returned Cloudflare challenge HTML.
 - The actor validates HTML responses before parsing. A response is accepted only when it contains `Review_review` and `Use Cases and Deployment Scope`.
 - The actor parses `self.__next_f.push(...)` chunks as JSON and extracts review `article` nodes from the React server component tree.
@@ -58,4 +61,6 @@
 
 ### Final Review Fields
 
-`recordType, productSlug, reviewSlug, title, rating, ratingNormalized, publishedDate, publishedDateText, trusted, incentive, reviewSource, author, authorFirst, authorLast, reviewerJobTitle, reviewerJobType, reviewerDepartment, companyName, companyIndustry, companySize, yearsExperience, authorPublic, linkedInProfileUrl, isVerified, verifiedBy, useCases, pros, cons, likelihoodToRecommend, url, source`
+The actor emits one dataset item per review. It does not push a separate product summary row, because that appears as an empty review in review-only exports.
+
+`recordType, productName, productSlug, reviewCount, reviewSlug, title, rating, ratingNormalized, publishedDate, publishedDateText, trusted, incentive, reviewSource, author, authorFirst, authorLast, reviewerJobTitle, reviewerJobType, reviewerDepartment, companyName, companyIndustry, companySize, yearsExperience, authorPublic, linkedInProfileUrl, isVerified, verifiedBy, useCases, pros, cons, likelihoodToRecommend, url, source`

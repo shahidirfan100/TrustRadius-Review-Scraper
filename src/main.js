@@ -44,7 +44,6 @@ const REQUEST_PROFILES = [
 ];
 
 const BLOCK_PATTERN = /Access Denied|captcha|Just a moment|Cloudflare|Too Many Requests|rate limit/i;
-const REVIEWS_PER_PAGE = 10;
 const MAX_PAGE_CONCURRENCY = 5;
 
 function extractSlug(url) {
@@ -59,6 +58,30 @@ function buildApiUrl(slug) {
 function buildReviewsPageUrl(slug, page) {
     const baseUrl = `https://www.trustradius.com/products/${slug}/reviews/all`;
     return page > 1 ? `${baseUrl}?page=${page}` : baseUrl;
+}
+
+function toTitleCase(value) {
+    return value
+        .split('-')
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
+function extractProductName(html, slug) {
+    const title = html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1];
+    const productName = title
+        ?.replace(/\s+Reviews from Real Users\s*\|\s*TrustRadius$/i, '')
+        .replace(/\s+Reviews\s*\|\s*TrustRadius$/i, '')
+        .trim();
+    return productName || toTitleCase(slug);
+}
+
+function extractTotalReviews(html) {
+    const totals = [...html.matchAll(/(?:\\?"totalReviews\\?":)(\d+)/g)]
+        .map((match) => Number(match[1]))
+        .filter((value) => Number.isFinite(value) && value > 0);
+    return totals.length ? Math.max(...totals) : null;
 }
 
 function stripNulls(obj) {
@@ -243,6 +266,14 @@ function isBlockedResponse(status, body) {
     return status === 403 || status === 429 || BLOCK_PATTERN.test(body);
 }
 
+function isBlockedHtmlResponse(status, body) {
+    const title = body.match(/<title[^>]*>(.*?)<\/title>/i)?.[1] || '';
+    return status === 403
+        || status === 429
+        || /Access Denied|captcha|Just a moment|Too Many Requests|rate limit/i.test(title)
+        || /Pardon Our Interruption|Access Denied|captcha/i.test(body);
+}
+
 async function fetchWithRetry(url, slug, proxyConf, retries = 3) {
     let lastErr;
     const plans = [
@@ -322,13 +353,12 @@ async function fetchHtmlWithRetry(url, slug, proxyConf, retries = 3) {
             const body = await response.text();
             const hasReviewPayload = body.includes('Review_review') && body.includes('Use Cases and Deployment Scope');
 
-            if (isBlockedResponse(response.status, body) && !hasReviewPayload) {
+            if (isBlockedHtmlResponse(response.status, body) && !hasReviewPayload) {
                 lastErr = new Error(`blocked with ${plan.profile.name}${plan.useProxy ? ' proxy' : ' direct'} (HTTP ${response.status})`);
                 log.warning(`${lastErr.message}; switching request profile`);
                 continue;
             }
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            if (!hasReviewPayload) throw new Error('Review payload missing from HTML response');
 
             if (attempt > 1) {
                 log.info(`Recovered HTML reviews with profile: ${plan.profile.name}${plan.useProxy ? ' + rotated proxy' : ''}`);
@@ -345,25 +375,66 @@ async function fetchHtmlWithRetry(url, slug, proxyConf, retries = 3) {
 
 async function fetchReviewPage(slug, page, proxyConf) {
     const html = await fetchHtmlWithRetry(buildReviewsPageUrl(slug, page), slug, proxyConf, 3);
-    return extractReviewArticles(html).map((article) => extractHtmlReviewRecord(article, slug));
+    return {
+        productName: extractProductName(html, slug),
+        totalReviews: extractTotalReviews(html),
+        page,
+        records: extractReviewArticles(html).map((article) => extractHtmlReviewRecord(article, slug)),
+    };
 }
 
-async function fetchWantedReviews(slug, resultsWanted, totalAvailable, proxyConf) {
-    const pagesNeeded = Math.ceil(Math.min(resultsWanted, totalAvailable || resultsWanted) / REVIEWS_PER_PAGE);
-    const pages = Array.from({ length: pagesNeeded }, (_, index) => index + 1);
+async function fetchWantedReviews(slug, resultsWanted, apiReviewCount, proxyConf) {
     const records = [];
+    const seen = new Set();
+    let productName = toTitleCase(slug);
+    let reviewCount = apiReviewCount || null;
+    let page = 1;
+    let stopReason = 'requested_count_reached';
 
-    for (let i = 0; i < pages.length; i += MAX_PAGE_CONCURRENCY) {
-        const pageBatch = pages.slice(i, i + MAX_PAGE_CONCURRENCY);
-        const pageResults = await Promise.all(pageBatch.map((page) => fetchReviewPage(slug, page, proxyConf)));
-        for (const pageRecords of pageResults) {
-            records.push(...pageRecords);
+    while (records.length < resultsWanted) {
+        const startPage = page;
+        const pageBatch = Array.from({ length: MAX_PAGE_CONCURRENCY }, (_, index) => startPage + index);
+        const settledResults = await Promise.allSettled(pageBatch.map((pageNumber) => fetchReviewPage(slug, pageNumber, proxyConf)));
+        let newRecordsInBatch = 0;
+
+        for (const result of settledResults) {
+            if (result.status === 'rejected') {
+                log.warning(`Review page request failed: ${result.reason.message}`);
+                continue;
+            }
+
+            const pageResult = result.value;
+            if (pageResult.productName) productName = pageResult.productName;
+            if (pageResult.totalReviews) reviewCount = Math.max(reviewCount || 0, pageResult.totalReviews);
+
+            for (const record of pageResult.records) {
+                const key = record.reviewSlug || JSON.stringify(record);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                records.push(record);
+                newRecordsInBatch++;
+                if (records.length >= resultsWanted) break;
+            }
             if (records.length >= resultsWanted) break;
         }
+
+        log.info(`Fetched review pages ${page}-${pageBatch.at(-1)} | saved=${records.length}/${resultsWanted}`);
+
         if (records.length >= resultsWanted) break;
+        if (newRecordsInBatch === 0) {
+            stopReason = 'no_more_reviews';
+            break;
+        }
+
+        page += MAX_PAGE_CONCURRENCY;
     }
 
-    return records.slice(0, resultsWanted);
+    return {
+        productName,
+        reviewCount: reviewCount || records.length,
+        records: records.slice(0, resultsWanted),
+        stopReason,
+    };
 }
 
 async function main() {
@@ -404,42 +475,35 @@ async function main() {
         }
         log.info(`Processing product: ${slug}`);
 
-        let apiData;
+        let apiData = null;
         try {
             apiData = await fetchWithRetry(buildApiUrl(slug), slug, proxyConf, 3);
         } catch (err) {
-            log.error(`Failed to fetch review API for ${slug}: ${err.message}`);
-            continue;
+            log.warning(`Summary API failed for ${slug}: ${err.message}. Continuing with review pages.`);
         }
 
         const summaryRecords = Array.isArray(apiData?.records) ? apiData.records : [];
         const total = apiData?.totalCount ?? summaryRecords.length;
         log.info(`API returned totalCount=${total} for ${slug}`);
         if (total === 0) {
-            log.warning(`No reviews found for ${slug}`);
-            continue;
+            log.warning(`Summary API returned no reviews for ${slug}; checking review pages anyway`);
         }
 
-        await Actor.pushData(stripNulls({
-            recordType: 'product',
-            productSlug: slug,
-            productName: slug,
-            reviewCount: total,
-            url: `https://www.trustradius.com/products/${slug}/reviews/all`,
-            source: 'api-summary',
-        }));
-
-        const reviewBatch = await fetchWantedReviews(slug, RESULTS_WANTED, total, proxyConf);
+        const reviewPageData = await fetchWantedReviews(slug, RESULTS_WANTED, total, proxyConf);
         const seen = new Set();
         const uniqueReviews = [];
-        for (const record of reviewBatch) {
+        for (const record of reviewPageData.records) {
             const key = record.reviewSlug || JSON.stringify(record);
             if (seen.has(key)) {
                 log.info(`Skipping duplicate review ${key}`);
                 continue;
             }
             seen.add(key);
-            uniqueReviews.push(record);
+            uniqueReviews.push(stripNulls({
+                productName: reviewPageData.productName,
+                reviewCount: reviewPageData.reviewCount,
+                ...record,
+            }));
         }
 
         if (uniqueReviews.length > 0) {
@@ -447,7 +511,7 @@ async function main() {
             saved += uniqueReviews.length;
         }
 
-        log.info(`Product ${slug}: saved ${uniqueReviews.length} reviews`);
+        log.info(`Product ${slug}: saved ${uniqueReviews.length} reviews | stop_reason=${reviewPageData.stopReason}`);
     }
 
     log.info(`Run complete | saved=${saved}`);

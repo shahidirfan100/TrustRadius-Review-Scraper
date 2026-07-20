@@ -38,24 +38,14 @@ Equip sales teams with real user feedback data. Understand competitor weaknesses
 
 ## Output Data
 
-Each item in the dataset contains a `recordType` field distinguishing between product information and individual reviews.
-
-### Product Record
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `recordType` | String | Always `"product"` |
-| `productName` | String | Name of the software product |
-| `productSlug` | String | Product identifier from URL |
-| `reviewCount` | Integer | Total number of reviews available for the product |
-| `url` | String | Product page URL |
-
-### Review Record
+Each item in the dataset is an individual review record.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `recordType` | String | Always `"review"` |
+| `productName` | String | Name of the software product |
 | `productSlug` | String | Product identifier |
+| `reviewCount` | Integer | Total number of reviews available for the product |
 | `reviewSlug` | String | Unique review slug |
 | `title` | String | Review title |
 | `rating` | String | Review rating on a 1-10 scale |
@@ -127,7 +117,9 @@ Extract reviews from any TrustRadius product page:
 ```json
 {
   "recordType": "review",
+  "productName": "Apify",
   "productSlug": "apify",
+  "reviewCount": 122,
   "reviewSlug": "apify-2026-05-25-10-50-41",
   "title": "highly recommended for web scraping",
   "rating": "10/10",
