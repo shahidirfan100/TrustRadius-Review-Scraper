@@ -1,0 +1,35 @@
+{
+  "title": "TrustRadius Review Scraper",
+  "description": "Scrape verified B2B software reviews from TrustRadius. Provide a product URL (e.g. https://www.trustradius.com/products/apify/reviews/all) to extract all reviews.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Product Review URL",
+      "type": "string",
+      "description": "Full TrustRadius product or reviews URL (e.g. https://www.trustradius.com/products/slack/reviews/all)",
+      "editor": "textfield",
+      "prefill": "https://www.trustradius.com/products/apify/reviews/all"
+    },
+    "results_wanted": {
+      "title": "Maximum number of reviews",
+      "type": "integer",
+      "description": "Maximum number of reviews to collect",
+      "minimum": 1,
+      "default": 20,
+      "prefill": 20,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Optional fallback proxy. The actor tries the stable direct API first and only uses proxy fallback when this is enabled.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": false
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

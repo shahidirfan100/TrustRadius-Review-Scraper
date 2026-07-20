@@ -1,0 +1,52 @@
+{
+  "actorSpecification": 1,
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "recordType",
+          "productName",
+          "title",
+          "rating",
+          "author",
+          "date",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "recordType": {
+            "label": "Type",
+            "format": "text"
+          },
+          "productName": {
+            "label": "Product",
+            "format": "text"
+          },
+          "title": {
+            "label": "Review Title",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "text"
+          },
+          "author": {
+            "label": "Reviewer",
+            "format": "text"
+          },
+          "date": {
+            "label": "Date",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
