@@ -1,50 +1,69 @@
 import { Actor, log } from 'apify';
 import { Impit } from 'impit';
+import { CookieJar } from 'tough-cookie';
 
 await Actor.init();
 
-const REQUEST_PROFILES = [
-    {
-        name: 'android-html',
+const MOBILE_USER_AGENT = 'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 '
+    + '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
+const REQUEST_PROFILES = {
+    summary: {
+        name: 'android-json',
         headers: (slug) => ({
-            'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 '
-                + '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'en-US,en;q=0.9',
-            referer: `https://www.trustradius.com/products/${slug}/reviews/all`,
-        }),
-    },
-    {
-        name: 'desktop-chrome',
-        headers: (slug) => ({
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            accept: 'application/json, text/plain, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'en-US,en;q=0.9',
-            referer: `https://www.trustradius.com/products/${slug}/reviews/all`,
-        }),
-    },
-    {
-        name: 'ios-safari',
-        headers: (slug) => ({
-            'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 '
-                + '(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+            'user-agent': MOBILE_USER_AGENT,
             accept: 'application/json, text/plain, */*',
             'accept-language': 'en-US,en;q=0.9',
             referer: `https://www.trustradius.com/products/${slug}/reviews/all`,
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': 'Android',
         }),
     },
-    {
-        name: 'android-api',
-        headers: () => ({
-            'user-agent': 'okhttp/4.12.0',
-            accept: 'application/json',
-            'accept-language': 'en-US',
+    reviews: {
+        name: 'android-html',
+        headers: (slug, page) => ({
+            'user-agent': MOBILE_USER_AGENT,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            referer: page > 1
+                ? `https://www.trustradius.com/products/${slug}/reviews/all?page=${page - 1}`
+                : `https://www.trustradius.com/products/${slug}/reviews/all`,
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-user': '?1',
+            'sec-fetch-dest': 'document',
+            'upgrade-insecure-requests': '1',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': 'Android',
         }),
     },
-];
+    desktopReviews: {
+        name: 'desktop-chrome-fallback',
+        headers: (slug, page) => ({
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                + '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            referer: page > 1
+                ? `https://www.trustradius.com/products/${slug}/reviews/all?page=${page - 1}`
+                : `https://www.trustradius.com/products/${slug}/reviews/all`,
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-user': '?1',
+            'sec-fetch-dest': 'document',
+            'upgrade-insecure-requests': '1',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': 'Windows',
+        }),
+    },
+};
 
-const BLOCK_PATTERN = /Access Denied|captcha|Just a moment|Cloudflare|Too Many Requests|rate limit/i;
+const BLOCK_PATTERN = /Pardon Our Interruption|<title[^>]*>\s*(?:Access Denied|Just a moment|Too Many Requests|rate limit)/i;
 const MAX_PAGE_CONCURRENCY = 5;
+const MAX_RETRY_DELAY_MS = 4000;
 
 function extractSlug(url) {
     const m = url.match(/\/products\/([^/?#]+)/);
@@ -96,12 +115,38 @@ function sleep(ms) {
     });
 }
 
-function createClient(proxyUrl) {
-    return new Impit({
-        browser: 'chrome',
-        ignoreTlsErrors: true,
-        ...(proxyUrl && { proxyUrl }),
-    });
+function createRequestSession(proxyUrl) {
+    const cookieJar = new CookieJar();
+    return {
+        client: new Impit({
+            browser: 'chrome',
+            ignoreTlsErrors: true,
+            timeout: 45000,
+            cookieJar,
+            ...(proxyUrl && { proxyUrl }),
+        }),
+        proxyUrl,
+    };
+}
+
+function retryDelay(attempt, retryAfterSeconds = null) {
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+        return Math.min(MAX_RETRY_DELAY_MS, retryAfterSeconds * 1000);
+    }
+    return Math.min(MAX_RETRY_DELAY_MS, 500 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 250));
+}
+
+function getRetryAfterSeconds(response) {
+    const value = Number(response?.headers?.get('retry-after'));
+    return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function createRetryError(message, response = null) {
+    const error = new Error(message);
+    error.retryable = true;
+    error.retryAfterSeconds = getRetryAfterSeconds(response);
+    error.rotateSession = response?.status === 403 || response?.status === 429;
+    return error;
 }
 
 function decodeHtml(value) {
@@ -274,107 +319,120 @@ function isBlockedHtmlResponse(status, body) {
         || /Pardon Our Interruption|Access Denied|captcha/i.test(body);
 }
 
-async function fetchWithRetry(url, slug, proxyConf, retries = 3) {
+async function fetchWithRetry(url, slug, proxyConf, sessionState, retries = 3) {
     let lastErr;
-    const plans = [
-        ...REQUEST_PROFILES.map((profile) => ({ profile, useProxy: false })),
-        ...(proxyConf ? REQUEST_PROFILES.map((profile) => ({ profile, useProxy: true })) : []),
-    ];
-    const maxAttempts = Math.min(Math.max(retries, REQUEST_PROFILES.length), plans.length);
+    const maxAttempts = Math.max(1, retries);
+    const profile = REQUEST_PROFILES.summary;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const plan = plans[attempt - 1];
-        const proxyUrl = plan.useProxy
-            ? await proxyConf.newUrl(`trustradius-${slug}-${attempt}-${Date.now()}`)
-            : undefined;
-        const client = createClient(proxyUrl);
-
         try {
-            const response = await client.fetch(url, {
-                headers: plan.profile.headers(slug),
+            const response = await sessionState.current.client.fetch(url, {
+                headers: profile.headers(slug),
             });
             const body = await response.text();
 
             if (isBlockedResponse(response.status, body)) {
-                lastErr = new Error(`blocked or rate limited with ${plan.profile.name}${plan.useProxy ? ' proxy' : ' direct'} (HTTP ${response.status})`);
-                log.warning(`${lastErr.message}; switching request profile`);
-                continue;
+                throw createRetryError(
+                    `blocked or rate limited with ${profile.name} (HTTP ${response.status})`,
+                    response,
+                );
             }
             if (response.status >= 500) {
-                lastErr = new Error(`server error ${response.status} with ${plan.profile.name}${plan.useProxy ? ' proxy' : ' direct'}`);
-                const wait = attempt * 1000;
-                log.warning(`${lastErr.message}; retrying in ${Math.round(wait / 1000)}s`);
-                await sleep(wait);
-                continue;
+                throw createRetryError(`server error ${response.status} with ${profile.name}`, response);
             }
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-            const data = JSON.parse(body);
+            let data;
+            try {
+                data = JSON.parse(body);
+            } catch {
+                throw createRetryError('Summary API returned invalid JSON', response);
+            }
             if (!Array.isArray(data?.records)) {
-                throw new Error(`Unexpected API shape. Keys: ${Object.keys(data || {}).join(', ') || 'none'}`);
+                throw createRetryError(
+                    `Unexpected API shape. Keys: ${Object.keys(data || {}).join(', ') || 'none'}`,
+                    response,
+                );
             }
-            if (attempt > 1) {
-                log.info(`Recovered with request profile: ${plan.profile.name}${plan.useProxy ? ' + rotated proxy' : ''}`);
-            }
+            if (attempt > 1) log.info(`Recovered summary API with ${profile.name}`);
             return data;
         } catch (err) {
             lastErr = err;
-            if (attempt === maxAttempts) break;
-            const wait = attempt * 500 + Math.random() * 250;
-            log.warning(`Request failed (${err.message}); retrying in ${Math.round(wait / 1000)}s`);
+            const isTransient = err.retryable || !/^HTTP 4\d\d$/.test(err.message);
+            if (attempt === maxAttempts || !isTransient) break;
+
+            if (err.rotateSession) {
+                const proxyUrl = proxyConf
+                    ? await proxyConf.newUrl(`trustradius-summary-${slug}-${attempt}-${Date.now()}`)
+                    : undefined;
+                Object.assign(sessionState, { current: createRequestSession(proxyUrl) });
+            }
+
+            const wait = retryDelay(attempt, err.retryAfterSeconds);
+            log.warning(`Summary request failed (${err.message}); retrying in ${Math.ceil(wait / 1000)}s`);
             await sleep(wait);
         }
     }
-    throw lastErr || new Error('All retries failed');
+    throw lastErr || new Error('All summary API retries failed');
 }
 
-async function fetchHtmlWithRetry(url, slug, proxyConf, retries = 3) {
+async function fetchHtmlWithRetry(url, slug, page, proxyConf, sessionState, retries = 3) {
     let lastErr;
-    const htmlProfiles = REQUEST_PROFILES.filter((profile) => ['android-html', 'desktop-chrome', 'ios-safari'].includes(profile.name));
-    const plans = [
-        ...htmlProfiles.map((profile) => ({ profile, useProxy: false })),
-        ...(proxyConf ? htmlProfiles.map((profile) => ({ profile, useProxy: true })) : []),
-    ];
-    const maxAttempts = Math.min(Math.max(retries, htmlProfiles.length), plans.length);
+    let profile = REQUEST_PROFILES.reviews;
+    const maxAttempts = Math.max(1, retries);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const plan = plans[attempt - 1];
-        const proxyUrl = plan.useProxy
-            ? await proxyConf.newUrl(`trustradius-html-${slug}-${attempt}-${Date.now()}`)
-            : undefined;
-        const client = createClient(proxyUrl);
-
         try {
-            const response = await client.fetch(url, {
-                headers: plan.profile.headers(slug),
+            const response = await sessionState.current.client.fetch(url, {
+                headers: profile.headers(slug, page),
             });
             const body = await response.text();
             const hasReviewPayload = body.includes('Review_review') && body.includes('Use Cases and Deployment Scope');
 
             if (isBlockedHtmlResponse(response.status, body) && !hasReviewPayload) {
-                lastErr = new Error(`blocked with ${plan.profile.name}${plan.useProxy ? ' proxy' : ' direct'} (HTTP ${response.status})`);
-                log.warning(`${lastErr.message}; switching request profile`);
-                continue;
+                const error = createRetryError(
+                    `blocked with ${profile.name} (HTTP ${response.status})`,
+                    response,
+                );
+                error.useFallbackProfile = profile === REQUEST_PROFILES.reviews;
+                throw error;
+            }
+            if (!hasReviewPayload) {
+                const error = createRetryError(`review payload missing with ${profile.name}`, response);
+                error.useFallbackProfile = profile === REQUEST_PROFILES.reviews;
+                throw error;
             }
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
             if (attempt > 1) {
-                log.info(`Recovered HTML reviews with profile: ${plan.profile.name}${plan.useProxy ? ' + rotated proxy' : ''}`);
+                log.info(`Recovered HTML reviews with profile: ${profile.name}${sessionState.current.proxyUrl ? ' + rotated proxy' : ''}`);
             }
             return body;
         } catch (err) {
             lastErr = err;
-            if (attempt === maxAttempts) break;
-            log.warning(`HTML request failed (${err.message}); switching request profile`);
+            const isTransient = err.retryable || !/^HTTP 4\d\d$/.test(err.message);
+            if (attempt === maxAttempts || !isTransient) break;
+
+            if (err.rotateSession || err.useFallbackProfile) {
+                if (err.rotateSession && proxyConf) {
+                    const proxyUrl = await proxyConf.newUrl(`trustradius-html-${slug}-${page}-${attempt}-${Date.now()}`);
+                    Object.assign(sessionState, { current: createRequestSession(proxyUrl) });
+                } else {
+                    Object.assign(sessionState, { current: createRequestSession() });
+                }
+                if (err.useFallbackProfile && !proxyConf) profile = REQUEST_PROFILES.desktopReviews;
+            }
+
+            const wait = retryDelay(attempt, err.retryAfterSeconds);
+            log.warning(`HTML request failed (${err.message}); retrying in ${Math.ceil(wait / 1000)}s`);
+            await sleep(wait);
         }
     }
     throw lastErr || new Error('All HTML retries failed');
 }
 
-async function fetchReviewPage(slug, page, proxyConf) {
-    const html = await fetchHtmlWithRetry(buildReviewsPageUrl(slug, page), slug, proxyConf, 3);
+async function fetchReviewPage(slug, page, proxyConf, sessionState) {
+    const html = await fetchHtmlWithRetry(buildReviewsPageUrl(slug, page), slug, page, proxyConf, sessionState, 3);
     return {
         productName: extractProductName(html, slug),
         totalReviews: extractTotalReviews(html),
@@ -383,19 +441,20 @@ async function fetchReviewPage(slug, page, proxyConf) {
     };
 }
 
-async function fetchWantedReviews(slug, resultsWanted, apiReviewCount, proxyConf) {
+async function fetchWantedReviews(slug, resultsWanted, apiReviewCount, proxyConf, sessionState) {
     const records = [];
     const seen = new Set();
     let productName = toTitleCase(slug);
     let reviewCount = apiReviewCount || null;
-    let page = 1;
     let stopReason = 'requested_count_reached';
 
-    while (records.length < resultsWanted) {
-        const startPage = page;
-        const pageBatch = Array.from({ length: MAX_PAGE_CONCURRENCY }, (_, index) => startPage + index);
-        const settledResults = await Promise.allSettled(pageBatch.map((pageNumber) => fetchReviewPage(slug, pageNumber, proxyConf)));
+    const processBatch = async (startPage, batchSize) => {
+        const pageBatch = Array.from({ length: batchSize }, (_, index) => startPage + index);
+        const settledResults = await Promise.allSettled(
+            pageBatch.map((pageNumber) => fetchReviewPage(slug, pageNumber, proxyConf, sessionState)),
+        );
         let newRecordsInBatch = 0;
+        let successfulPages = 0;
 
         for (const result of settledResults) {
             if (result.status === 'rejected') {
@@ -403,6 +462,7 @@ async function fetchWantedReviews(slug, resultsWanted, apiReviewCount, proxyConf
                 continue;
             }
 
+            successfulPages++;
             const pageResult = result.value;
             if (pageResult.productName) productName = pageResult.productName;
             if (pageResult.totalReviews) reviewCount = Math.max(reviewCount || 0, pageResult.totalReviews);
@@ -418,15 +478,39 @@ async function fetchWantedReviews(slug, resultsWanted, apiReviewCount, proxyConf
             if (records.length >= resultsWanted) break;
         }
 
-        log.info(`Fetched review pages ${page}-${pageBatch.at(-1)} | saved=${records.length}/${resultsWanted}`);
+        log.info(`Fetched review pages ${startPage}-${pageBatch.at(-1)} | saved=${records.length}/${resultsWanted}`);
+        return { newRecordsInBatch, successfulPages, lastPage: pageBatch.at(-1) };
+    };
 
-        if (records.length >= resultsWanted) break;
-        if (newRecordsInBatch === 0) {
-            stopReason = 'no_more_reviews';
-            break;
+    // Bootstrap the browser-like session before parallel pagination so cookies set by
+    // the first document request are available to every subsequent page request.
+    const bootstrap = await processBatch(1, 1);
+    if (records.length >= resultsWanted) {
+        return {
+            productName,
+            reviewCount: reviewCount || records.length,
+            records: records.slice(0, resultsWanted),
+            stopReason,
+        };
+    }
+    if (bootstrap.successfulPages > 0 && bootstrap.newRecordsInBatch === 0) {
+        stopReason = 'no_more_reviews';
+    } else {
+        const parallelBatchSize = Math.max(1, MAX_PAGE_CONCURRENCY - 1);
+        let page = 2;
+        while (records.length < resultsWanted) {
+            const batch = await processBatch(page, parallelBatchSize);
+            if (records.length >= resultsWanted) break;
+            if (batch.successfulPages === 0) {
+                stopReason = 'request_failures';
+                break;
+            }
+            if (batch.newRecordsInBatch === 0) {
+                stopReason = 'no_more_reviews';
+                break;
+            }
+            page = batch.lastPage + 1;
         }
-
-        page += MAX_PAGE_CONCURRENCY;
     }
 
     return {
@@ -474,10 +558,11 @@ async function main() {
             continue;
         }
         log.info(`Processing product: ${slug}`);
+        const sessionState = { current: createRequestSession() };
 
         let apiData = null;
         try {
-            apiData = await fetchWithRetry(buildApiUrl(slug), slug, proxyConf, 3);
+            apiData = await fetchWithRetry(buildApiUrl(slug), slug, proxyConf, sessionState, 3);
         } catch (err) {
             log.warning(`Summary API failed for ${slug}: ${err.message}. Continuing with review pages.`);
         }
@@ -489,7 +574,7 @@ async function main() {
             log.warning(`Summary API returned no reviews for ${slug}; checking review pages anyway`);
         }
 
-        const reviewPageData = await fetchWantedReviews(slug, RESULTS_WANTED, total, proxyConf);
+        const reviewPageData = await fetchWantedReviews(slug, RESULTS_WANTED, total, proxyConf, sessionState);
         const seen = new Set();
         const uniqueReviews = [];
         for (const record of reviewPageData.records) {

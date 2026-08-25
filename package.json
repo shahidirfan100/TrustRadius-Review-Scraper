@@ -6,7 +6,8 @@
   "dependencies": {
     "apify": "^3.7.2",
     "crawlee": "^3.17.0",
-    "impit": "^0.14.2"
+    "impit": "^0.14.2",
+    "tough-cookie": "^6.0.0"
   },
   "devDependencies": {
     "@apify/eslint-config": "^2.0.0",
