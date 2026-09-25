@@ -4,8 +4,10 @@ import { CookieJar } from 'tough-cookie';
 
 await Actor.init();
 
+const IMPIT_BROWSER = 'chrome124';
+
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 '
-    + '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+    + '(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 
 const REQUEST_PROFILES = {
     summary: {
@@ -64,6 +66,7 @@ const REQUEST_PROFILES = {
 const BLOCK_PATTERN = /Pardon Our Interruption|<title[^>]*>\s*(?:Access Denied|Just a moment|Too Many Requests|rate limit)/i;
 const MAX_PAGE_CONCURRENCY = 5;
 const MAX_RETRY_DELAY_MS = 4000;
+const MAX_SESSION_ID_LENGTH = 50;
 
 function extractSlug(url) {
     const m = url.match(/\/products\/([^/?#]+)/);
@@ -119,7 +122,7 @@ function createRequestSession(proxyUrl) {
     const cookieJar = new CookieJar();
     return {
         client: new Impit({
-            browser: 'chrome',
+            browser: IMPIT_BROWSER,
             ignoreTlsErrors: true,
             timeout: 45000,
             cookieJar,
@@ -127,6 +130,27 @@ function createRequestSession(proxyUrl) {
         }),
         proxyUrl,
     };
+}
+
+function toSessionId(kind, slug, page, attempt) {
+    const sanitize = (value) => String(value).replace(/[^\w.~]+/g, '_');
+    const stamp = Date.now().toString(36);
+    const prefix = `tr_${sanitize(kind)}`;
+    const suffix = `_${page}_${attempt}_${stamp}`;
+    const room = MAX_SESSION_ID_LENGTH - prefix.length - suffix.length - 1;
+    const safeSlug = sanitize(slug).slice(0, Math.max(1, room));
+    return `${prefix}_${safeSlug}${suffix}`.slice(0, MAX_SESSION_ID_LENGTH);
+}
+
+async function createSession(proxyConf, sessionId) {
+    if (!proxyConf) return createRequestSession();
+    try {
+        const proxyUrl = await proxyConf.newUrl(sessionId);
+        return createRequestSession(proxyUrl);
+    } catch (err) {
+        log.warning(`Proxy session ${sessionId} failed: ${err.message}; retrying on a direct connection`);
+        return createRequestSession();
+    }
 }
 
 function retryDelay(attempt, retryAfterSeconds = null) {
@@ -137,7 +161,9 @@ function retryDelay(attempt, retryAfterSeconds = null) {
 }
 
 function getRetryAfterSeconds(response) {
-    const value = Number(response?.headers?.get('retry-after'));
+    const raw = response?.headers?.get('retry-after');
+    if (raw === null || raw === undefined || raw === '') return null;
+    const value = Number(raw);
     return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
@@ -319,6 +345,10 @@ function isBlockedHtmlResponse(status, body) {
         || /Pardon Our Interruption|Access Denied|captcha/i.test(body);
 }
 
+function isReviewsPageShell(body) {
+    return body.includes('self.__next_f') && /<title[^>]*>[^<]*Reviews[^<]*\|\s*TrustRadius/i.test(body);
+}
+
 async function fetchWithRetry(url, slug, proxyConf, sessionState, retries = 3) {
     let lastErr;
     const maxAttempts = Math.max(1, retries);
@@ -362,10 +392,9 @@ async function fetchWithRetry(url, slug, proxyConf, sessionState, retries = 3) {
             if (attempt === maxAttempts || !isTransient) break;
 
             if (err.rotateSession) {
-                const proxyUrl = proxyConf
-                    ? await proxyConf.newUrl(`trustradius-summary-${slug}-${attempt}-${Date.now()}`)
-                    : undefined;
-                Object.assign(sessionState, { current: createRequestSession(proxyUrl) });
+                Object.assign(sessionState, {
+                    current: await createSession(proxyConf, toSessionId('summary', slug, 1, attempt)),
+                });
             }
 
             const wait = retryDelay(attempt, err.retryAfterSeconds);
@@ -398,6 +427,9 @@ async function fetchHtmlWithRetry(url, slug, page, proxyConf, sessionState, retr
                 throw error;
             }
             if (!hasReviewPayload) {
+                if (response.ok && !isBlockedHtmlResponse(response.status, body) && isReviewsPageShell(body)) {
+                    return null;
+                }
                 const error = createRetryError(`review payload missing with ${profile.name}`, response);
                 error.useFallbackProfile = profile === REQUEST_PROFILES.reviews;
                 throw error;
@@ -414,11 +446,12 @@ async function fetchHtmlWithRetry(url, slug, page, proxyConf, sessionState, retr
             if (attempt === maxAttempts || !isTransient) break;
 
             if (err.rotateSession || err.useFallbackProfile) {
-                if (err.rotateSession && proxyConf) {
-                    const proxyUrl = await proxyConf.newUrl(`trustradius-html-${slug}-${page}-${attempt}-${Date.now()}`);
-                    Object.assign(sessionState, { current: createRequestSession(proxyUrl) });
+                if (err.rotateSession) {
+                    Object.assign(sessionState, {
+                        current: await createSession(proxyConf, toSessionId('html', slug, page, attempt)),
+                    });
                 } else {
-                    Object.assign(sessionState, { current: createRequestSession() });
+                    Object.assign(sessionState, { current: createRequestSession(sessionState.current.proxyUrl) });
                 }
                 if (err.useFallbackProfile && !proxyConf) profile = REQUEST_PROFILES.desktopReviews;
             }
@@ -433,6 +466,9 @@ async function fetchHtmlWithRetry(url, slug, page, proxyConf, sessionState, retr
 
 async function fetchReviewPage(slug, page, proxyConf, sessionState) {
     const html = await fetchHtmlWithRetry(buildReviewsPageUrl(slug, page), slug, page, proxyConf, sessionState, 3);
+    if (html === null) {
+        return { productName: null, totalReviews: null, page, records: [] };
+    }
     return {
         productName: extractProductName(html, slug),
         totalReviews: extractTotalReviews(html),
@@ -558,7 +594,8 @@ async function main() {
             continue;
         }
         log.info(`Processing product: ${slug}`);
-        const sessionState = { current: createRequestSession() };
+        const sessionState = { current: await createSession(proxyConf, toSessionId('start', slug, 1, 1)) };
+        if (sessionState.current.proxyUrl) log.info(`Proxy session active for ${slug}`);
 
         let apiData = null;
         try {
@@ -597,6 +634,12 @@ async function main() {
         }
 
         log.info(`Product ${slug}: saved ${uniqueReviews.length} reviews | stop_reason=${reviewPageData.stopReason}`);
+
+        if (reviewPageData.stopReason === 'request_failures' && !proxyConf) {
+            log.warning(
+                `Review pages for ${slug} were blocked without a proxy. Enable proxyConfiguration.useApifyProxy in the input and rerun.`,
+            );
+        }
     }
 
     log.info(`Run complete | saved=${saved}`);
